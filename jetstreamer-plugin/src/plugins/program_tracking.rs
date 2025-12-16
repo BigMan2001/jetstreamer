@@ -88,6 +88,7 @@ impl Plugin for ProgramTrackingPlugin {
         _thread_id: usize,
         _db: Option<Arc<Client>>,
         transaction: &'a TransactionData,
+        block_time: i64,
     ) -> PluginFuture<'a> {
         async move {
             let message = &transaction.transaction.message;
