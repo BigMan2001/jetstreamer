@@ -1766,9 +1766,9 @@ where
                         last_processed_slot = slot;
 
                         // 🔥 HARD FILTER
-                        if !slots_filter.contains(&slot) {
-                            continue;
-                        }
+                        // if !slots_filter.contains(&slot) {
+                        //     continue;
+                        // }
 
                         let blocktime = block.meta.blocktime as i64;
 
