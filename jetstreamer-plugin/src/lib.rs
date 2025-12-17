@@ -129,6 +129,7 @@ use futures_util::FutureExt;
 use jetstreamer_firehose::firehose::{
     BlockData, EntryData, RewardsData, Stats, StatsTracking, TransactionData, firehose,
 };
+use std::collections::HashSet;
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -187,7 +188,6 @@ pub trait Plugin: Send + Sync + 'static {
         _thread_id: usize,
         _db: Option<Arc<Client>>,
         _transaction: &'a TransactionData,
-        _block_time: i64,
     ) -> PluginFuture<'a> {
         async move { Ok(()) }.boxed()
     }
@@ -252,16 +252,18 @@ pub struct PluginRunner {
     clickhouse_dsn: String,
     num_threads: usize,
     db_update_interval_slots: u64,
+    slots_filter: Arc<HashSet<u64>>,
 }
 
 impl PluginRunner {
     /// Creates a new runner that writes to `clickhouse_dsn` using `num_threads`.
-    pub fn new(clickhouse_dsn: impl Display, num_threads: usize) -> Self {
+    pub fn new(clickhouse_dsn: impl Display, num_threads: usize, slots_filter: HashSet<u64>) -> Self {
         Self {
             plugins: Arc::new(Vec::new()),
             clickhouse_dsn: clickhouse_dsn.to_string(),
             num_threads: std::cmp::max(1, num_threads),
             db_update_interval_slots: 100,
+            slots_filter: Arc::new(slots_filter), 
         }
     }
 
@@ -322,58 +324,21 @@ impl PluginRunner {
         let clickhouse_enabled = clickhouse.is_some();
         let slots_since_flush = Arc::new(AtomicU64::new(0));
 
-        // ✅ CONSTANT DEFAULT BLOCK TIME (NO BLOCK HANDLER)
-        let default_block_time: i64 = 0;
-
-        let slot_block_time: Arc<DashMap<u64, i64>> = Arc::new(DashMap::new());
-
-        let on_block = {
-            let slot_block_time = slot_block_time.clone();
-        
-            move |_thread_id: usize, block: BlockData| {
-                let slot_block_time = slot_block_time.clone();
-        
-                async move {
-                    match block {
-                        BlockData::Block { slot, block_time, .. } => {
-                            // save block_time, default to 0
-                            slot_block_time.insert(slot, block_time.unwrap_or(0));
-                        }
-                        BlockData::PossibleLeaderSkipped { slot } => {
-                            // still insert something to avoid missing lookups
-                            slot_block_time.insert(slot, 0);
-                        }
-                    }
-                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-                }
-                .boxed()
-            }
-        };
-        
-
         let on_transaction = {
             let plugin_handles = plugin_handles.clone();
             let clickhouse = clickhouse.clone();
             let shutting_down = shutting_down.clone();
-            let slot_block_time = slot_block_time.clone();
         
-            move |thread_id: usize, transaction: TransactionData| {
+            move |thread_id: usize, transaction: TransactionData | {
                 let plugin_handles = plugin_handles.clone();
                 let clickhouse = clickhouse.clone();
                 let shutting_down = shutting_down.clone();
-                let slot_block_time = slot_block_time.clone();
         
                 async move {
                     if shutting_down.load(Ordering::SeqCst) {
                         return Ok(());
                     }
-        
-                    // 🔑 resolve block_time by slot (non-optional)
-                    let block_time: i64 = slot_block_time
-                        .get(&transaction.slot)
-                        .map(|v| *v)
-                        .unwrap_or(0);
-        
+                 
                     let transaction = Arc::new(transaction);
         
                     for handle in plugin_handles.iter() {
@@ -383,7 +348,6 @@ impl PluginRunner {
                                 thread_id,
                                 clickhouse.clone(),
                                 transaction.as_ref(),
-                                block_time,
                             )
                             .await
                         {
@@ -399,28 +363,6 @@ impl PluginRunner {
                 }
                 .boxed()
             }
-        };
-
-        let on_entry = |_thread_id: usize, _entry: EntryData| {
-            async move {
-                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-            }
-            .boxed()
-        };
-
-        
-        let on_reward = |_thread_id: usize, _reward: RewardsData| {
-            async move {
-                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-            }
-            .boxed()
-        };
-
-        let on_error = |_thread_id: usize, _err: FirehoseErrorContext| {
-            async move {
-                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-            }
-            .boxed()
         };
 
         let total_slot_count = slot_range.end.saturating_sub(slot_range.start);
@@ -467,15 +409,17 @@ impl PluginRunner {
         let mut firehose_future = Box::pin(firehose(
             self.num_threads as u64,
             slot_range,
-            Some(on_block),
+            self.slots_filter.clone(),
+            None::<fn(usize, BlockData) -> _>,
             Some(on_transaction),
-            Some(on_entry),
-            Some(on_reward),
-            Some(on_error),
+            None::<fn(usize, EntryData) -> _>,
+            None::<fn(usize, RewardsData) -> _>,
+            None::<fn(usize, FirehoseErrorContext) -> _>,
             stats_tracking,
             Some(shutdown_tx.subscribe()),
         ));
         
+
         let firehose_result = tokio::select! {
             res = &mut firehose_future => res,
             _ = signal::ctrl_c() => {

@@ -74,7 +74,6 @@ impl Plugin for InstructionTrackingPlugin {
         _thread_id: usize,
         _db: Option<Arc<Client>>,
         transaction: &'a TransactionData,
-        block_time: i64,
     ) -> PluginFuture<'a> {
         async move {
             let (vote_instruction_count, non_vote_instruction_count) =

@@ -530,6 +530,8 @@ pub struct TransactionData {
     pub transaction_status_meta: solana_transaction_status::TransactionStatusMeta,
     /// Fully decoded transaction.
     pub transaction: VersionedTransaction,
+    /// Block time.
+    pub blocktime: i64
 }
 
 /// Block entry metadata passed to [`Handler`] callbacks.
@@ -661,7 +663,7 @@ pub struct FirehoseErrorContext {
 /// runner restarts from the last processed slot to maintain coverage.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats, OnError>(
+pub async fn firehose_old<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats, OnError>(
     threads: u64,
     slot_range: Range<u64>,
     on_block: Option<OnBlock>,
@@ -1085,6 +1087,7 @@ where
                                                 is_vote,
                                                 transaction_status_meta: as_native_metadata.clone(),
                                                 transaction: versioned_tx.clone(),
+                                                blocktime: 0
                                             },
                                         )
                                         .await
@@ -1610,6 +1613,258 @@ where
     }
     Ok(())
 }
+
+
+/// Streams transactions for selected slots using the Firehose protocol.
+///
+/// This is a pruned and optimized variant of the original firehose:
+/// - Only the `on_tx` handler is invoked
+/// - All other handlers are accepted for API compatibility but are ignored
+/// - Transactions are decoded **only** for slots present in `slots_filter`
+/// - Block time is propagated to `TransactionData.blocktime` from block metadata
+///
+/// The requested `slot_range` is half-open: `[start, end)`.
+/// On recoverable errors, the runner restarts from the last processed slot
+/// to maintain full coverage.
+///
+/// # Parameters
+/// - `threads`: Number of parallel firehose workers
+/// - `slot_range`: Slot range to scan (half-open)
+/// - `slots_filter`: Exact set of slots to process transactions for
+/// - `on_tx`: Transaction handler (required)
+/// - `shutdown_signal`: Optional shutdown broadcast receiver
+///
+/// # Returns
+/// Returns `Ok(())` on successful completion, or
+/// `(FirehoseError, slot)` on failure.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub async fn firehose<OnBlock, OnTransaction, OnEntry, OnRewards, OnStats, OnError>(
+    threads: u64,
+    slot_range: Range<u64>,
+    slots_filter: Arc<std::collections::HashSet<u64>>, // ✅ ONLY NEW PARAM
+    _on_block: Option<OnBlock>,
+    on_tx: Option<OnTransaction>,
+    _on_entry: Option<OnEntry>,
+    _on_rewards: Option<OnRewards>,
+    _on_error: Option<OnError>,
+    _stats_tracking: Option<StatsTracking<OnStats>>,
+    shutdown_signal: Option<broadcast::Receiver<()>>,
+) -> Result<(), (FirehoseError, u64)>
+where
+    OnBlock: Handler<BlockData>,
+    OnTransaction: Handler<TransactionData>,
+    OnEntry: Handler<EntryData>,
+    OnRewards: Handler<RewardsData>,
+    OnStats: Handler<Stats>,
+    OnError: Handler<FirehoseErrorContext>,
+{
+    if threads == 0 {
+        return Err((
+            FirehoseError::OnLoadError("threads must be > 0".into()),
+            slot_range.start,
+        ));
+    }
+
+    let on_tx = on_tx.ok_or((
+        FirehoseError::OnLoadError("on_tx handler required".into()),
+        slot_range.start,
+    ))?;
+
+    let client = Client::new();
+    let slot_range = Arc::new(slot_range);
+    let subranges = generate_subranges(&slot_range, threads);
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    if let Some(rx) = shutdown_signal.as_ref() {
+        let mut rx = rx.resubscribe();
+        let flag = shutdown_flag.clone();
+        tokio::spawn(async move {
+            let _ = rx.recv().await;
+            flag.store(true, Ordering::SeqCst);
+        });
+    }
+
+    let mut handles: Vec<tokio::task::JoinHandle<Result<(), (FirehoseError, u64)>>> =
+        Vec::with_capacity(subranges.len());
+
+    for (thread_id, mut range) in subranges.into_iter().enumerate() {
+        let client = client.clone();
+        let slots_filter = slots_filter.clone();
+        let on_tx = on_tx.clone();
+        let shutdown_flag = shutdown_flag.clone();
+        let mut shutdown_rx = shutdown_signal.as_ref().map(|r| r.resubscribe());
+
+        let handle = tokio::spawn(async move {
+            let mut last_processed_slot = range.start.saturating_sub(1);
+
+            while let Err((err, restart_slot)) = async {
+                if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
+                    return Ok(());
+                }
+
+                let epoch_range =
+                    slot_to_epoch(range.start)..=slot_to_epoch(range.end - 1);
+
+                for epoch in epoch_range {
+                    if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
+                        return Ok(());
+                    }
+
+                   let stream = fetch_epoch_stream(epoch, &client).await;
+
+
+                    let mut reader = NodeReader::new(stream);
+                    reader
+                        .read_raw_header()
+                        .await
+                        .map_err(|e| (FirehoseError::ReadHeader(e), range.start))?;
+
+                    let (epoch_start, epoch_end) = epoch_to_slot_range(epoch);
+                    let local_start = range.start.max(epoch_start);
+                    let local_end = (range.end - 1).min(epoch_end);
+
+                    if local_start > local_end {
+                        continue;
+                    }
+
+                    if local_start > epoch_start {
+                        reader
+                            .seek_to_slot(local_start - 1)
+                            .await
+                            .map_err(|e| (e, local_start))?;
+                    }
+
+                    loop {
+                        if poll_shutdown(&shutdown_flag, &mut shutdown_rx) {
+                            return Ok(());
+                        }
+
+                        let nodes = reader
+                            .read_until_block()
+                            .await
+                            .map_err(|e| {
+                                (
+                                    FirehoseError::ReadUntilBlockError(e),
+                                    last_processed_slot,
+                                )
+                            })?;
+
+                        if nodes.is_empty() {
+                            break;
+                        }
+
+                        let block = nodes
+                            .get_block()
+                            .map_err(|e| (FirehoseError::GetBlockError(e), last_processed_slot))?;
+
+                        let slot = block.slot;
+                        if slot < range.start || slot >= range.end {
+                            continue;
+                        }
+
+                        last_processed_slot = slot;
+
+                        // 🔥 HARD FILTER
+                        if !slots_filter.contains(&slot) {
+                            continue;
+                        }
+
+                        let blocktime = block.meta.blocktime as i64;
+
+                        for node in &nodes.0 {
+                            if let crate::node::Node::Transaction(tx) = node.get_node() {
+                                let versioned_tx = tx.as_parsed().map_err(|e| {
+                                    (
+                                        FirehoseError::NodeDecodingError(0, e),
+                                        slot,
+                                    )
+                                })?;
+
+                                let frames = nodes
+                                    .reassemble_dataframes(tx.metadata.clone())
+                                    .map_err(|e| {
+                                        (
+                                            FirehoseError::NodeDecodingError(0, e),
+                                            slot,
+                                        )
+                                    })?;
+
+                                let status_meta =
+                                    decode_transaction_status_meta_from_frame(slot, frames)
+                                        .map_err(|e| {
+                                            (
+                                                FirehoseError::NodeDecodingError(0, e),
+                                                slot,
+                                            )
+                                        })?;
+
+                                let message_hash = versioned_tx.message.hash();
+                                let signature = *versioned_tx
+                                    .signatures
+                                    .first()
+                                    .ok_or((
+                                        FirehoseError::OnLoadError(
+                                            "tx missing signature".into(),
+                                        ),
+                                        slot,
+                                    ))?;
+
+                                let is_vote = is_simple_vote_transaction(&versioned_tx);
+
+                                on_tx(
+                                    thread_id,
+                                    TransactionData {
+                                        slot,
+                                        transaction_slot_index: tx.index.unwrap() as usize,
+                                        signature,
+                                        message_hash,
+                                        is_vote,
+                                        transaction_status_meta: status_meta,
+                                        transaction: versioned_tx,
+                                        blocktime,
+                                    },
+                                )
+                                .await
+                                .map_err(|e| {
+                                    (
+                                        FirehoseError::TransactionHandlerError(e),
+                                        slot,
+                                    )
+                                })?;
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
+            }
+            .await
+            {
+                if is_shutdown_error(&err) {
+                    return Ok(());
+                }
+
+                if matches!(err, FirehoseError::SlotOffsetIndexError(_)) {
+                    SLOT_OFFSET_INDEX.invalidate_epoch(slot_to_epoch(restart_slot));
+                }
+
+                range.start = restart_slot.max(last_processed_slot + 1);
+            }
+
+            Ok(())
+        });
+
+        handles.push(handle);
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    Ok(())
+}
+
 
 #[allow(clippy::result_large_err)]
 /// Builds a Geyser-backed firehose and returns a slot notification stream.

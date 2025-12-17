@@ -128,7 +128,7 @@ use jetstreamer_plugin::{
     },
 };
 use std::sync::Arc;
-
+use std::collections::HashSet;
 const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker threads
 
 #[derive(Clone, Copy)]
@@ -382,7 +382,7 @@ impl JetstreamerRunner {
     }
 
     /// Builds the plugin runtime and streams blocks through every registered [`Plugin`].
-    pub fn run(self) -> Result<(), PluginRunnerError> {
+    pub fn run(self, slots_filter: HashSet<u64>) -> Result<(), PluginRunnerError> {
         solana_logger::setup_with_default(&self.log_level);
 
         if let Ok(index_url) = get_index_base_url() {
@@ -405,7 +405,7 @@ impl JetstreamerRunner {
             clickhouse_enabled
         );
 
-        let mut runner = PluginRunner::new(&self.clickhouse_dsn, threads);
+        let mut runner = PluginRunner::new(&self.clickhouse_dsn, threads, slots_filter);
         for plugin in &self.config.builtin_plugins {
             runner.register(plugin.instantiate());
         }
