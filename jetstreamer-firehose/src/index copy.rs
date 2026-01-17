@@ -40,6 +40,7 @@ use std::{
     collections::HashMap,
     ops::RangeInclusive,
     sync::{
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -47,8 +48,6 @@ use std::{
 use thiserror::Error;
 use tokio::{sync::OnceCell, task::yield_now, time::sleep};
 use xxhash_rust::xxh64::xxh64;
-use std::sync::Arc;
-use crate::epoch::HttpPool;
 
 const COMPACT_INDEX_MAGIC: &[u8; 8] = b"compiszd";
 const BUCKET_HEADER_SIZE: usize = 16;
@@ -1003,7 +1002,7 @@ fn parse_compact_index_header(
 }
 
 async fn fetch_epoch_root(
-    pool: &HttpPool,
+    client: &Client,
     base_url: &Url,
     epoch: u64,
 ) -> Result<(Cid, Url), SlotOffsetIndexError> {
@@ -1012,13 +1011,12 @@ async fn fetch_epoch_root(
         .join(&car_path)
         .map_err(|err| SlotOffsetIndexError::InvalidIndexUrl(format!("{car_path} ({err})")))?;
 
-    let mut bytes = fetch_range(pool, &car_url, 0, HTTP_PREFETCH_BYTES - 1, false).await?;
+    let mut bytes = fetch_range(client, &car_url, 0, HTTP_PREFETCH_BYTES - 1, false).await?;
     let (header_len, prefix) = decode_varint(&bytes)
         .map_err(|msg| SlotOffsetIndexError::CarHeaderError(car_url.clone(), msg))?;
     let total_needed = prefix + header_len as usize;
-
     if bytes.len() < total_needed {
-        bytes = fetch_range(pool, &car_url, 0, total_needed as u64 - 1, false).await?;
+        bytes = fetch_range(client, &car_url, 0, total_needed as u64 - 1, false).await?;
         if bytes.len() < total_needed {
             return Err(SlotOffsetIndexError::CarHeaderError(
                 car_url.clone(),
@@ -1029,7 +1027,6 @@ async fn fetch_epoch_root(
             ));
         }
     }
-
     let header_bytes = &bytes[prefix..total_needed];
     let value: Value = serde_cbor::from_slice(header_bytes).map_err(|err| {
         SlotOffsetIndexError::CarHeaderError(
@@ -1037,10 +1034,8 @@ async fn fetch_epoch_root(
             format!("failed to decode CBOR: {err}"),
         )
     })?;
-
     let root_cid = extract_root_cid(&value)
         .map_err(|msg| SlotOffsetIndexError::CarHeaderError(car_url.clone(), msg.to_string()))?;
-
     Ok((root_cid, car_url))
 }
 
@@ -1403,9 +1398,6 @@ fn parse_metadata(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
     Ok(map)
 }
 
-/// Resolves the base URL used to fetch compact index artifacts.
-///
-/// Uses `JETSTREAMER_COMPACT_INDEX_BASE_URL` when set, otherwise falls back to [`BASE_URL`].
 pub fn get_index_base_url() -> Result<Url, SlotOffsetIndexError> {
     let base = std::env::var("JETSTREAMER_COMPACT_INDEX_BASE_URL")
         .unwrap_or_else(|_| BASE_URL.to_string());
