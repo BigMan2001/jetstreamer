@@ -37,8 +37,7 @@ use std::path::Path;
 
 use crate::{
     LOG_MODULE, SharedError,
-    epochs::{epoch_to_slot_range, slot_to_epoch},
-    epoch::{fetch_epoch_stream, read_proxies_file, HttpPool},
+    epochs::{epoch_to_slot_range, fetch_epoch_stream, slot_to_epoch},
     index::{SLOT_OFFSET_INDEX, SlotOffsetIndexError},
     node_reader::NodeReader,
     utils,
@@ -717,29 +716,6 @@ where
     ))?;
 
     let client = Client::new();
-
-
-    // ✅ Build proxy pool (or direct) for Old Faithful epoch CAR fetching
-    let pool = match proxies_file {
-        None => Arc::new(HttpPool::new(Vec::new())),
-        Some(p) => {
-            let proxies = read_proxies_file(p.as_ref()).map_err(|e| {
-                (
-                    FirehoseError::OnLoadError(Box::new(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!(
-                            "failed to read proxies file {}: {}",
-                            p.as_ref().display(),
-                            e
-                        ),
-                    ))),
-                    slot_range.start,
-                )
-            })?;
-            Arc::new(HttpPool::new(proxies))
-        }
-    };
-
     let slot_range = Arc::new(slot_range);
     let subranges = generate_subranges(&slot_range, threads);
 
@@ -757,7 +733,6 @@ where
         Vec::with_capacity(subranges.len());
 
     for (thread_id, mut range) in subranges.into_iter().enumerate() {
-        let pool = pool.clone(); // <-- clone for this task
         let client = client.clone();
         let slots_filter = slots_filter.clone();
         let on_tx = on_tx.clone();
@@ -780,10 +755,10 @@ where
                         return Ok(());
                     }
 
-                    let stream = fetch_epoch_stream(epoch, pool.clone()).await;
+                    let stream = fetch_epoch_stream(epoch, &client).await;
 
 
-                    let mut reader = NodeReader::new(stream, pool.clone());
+                    let mut reader = NodeReader::new(stream);
                     reader
                         .read_raw_header()
                         .await

@@ -40,6 +40,7 @@ use std::{
     collections::HashMap,
     ops::RangeInclusive,
     sync::{
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -47,8 +48,6 @@ use std::{
 use thiserror::Error;
 use tokio::{sync::OnceCell, task::yield_now, time::sleep};
 use xxhash_rust::xxh64::xxh64;
-use std::sync::Arc;
-use crate::epoch::HttpPool;
 
 const COMPACT_INDEX_MAGIC: &[u8; 8] = b"compiszd";
 const BUCKET_HEADER_SIZE: usize = 16;
@@ -59,7 +58,7 @@ const METADATA_KEY_KIND: &[u8] = b"index_kind";
 const METADATA_KEY_EPOCH: &[u8] = b"epoch";
 const HTTP_PREFETCH_BYTES: u64 = 4 * 1024; // initial bytes to fetch for headers
 const FETCH_RANGE_MAX_RETRIES: usize = 10;
-const FETCH_RANGE_BASE_DELAY_MS: u64 = 10_000;
+const FETCH_RANGE_BASE_DELAY_MS: u64 = 5_000;
 const MIN_HIT_SPACING_MS: u64 = 20;
 
 /// Errors returned while accessing the compact slot offset index.
@@ -119,16 +118,15 @@ impl EpochCacheKey {
 }
 
 /// Looks up the byte offset of a slot within Old Faithful firehose CAR archives.
-pub async fn slot_to_offset(slot: u64, pool: &HttpPool,) -> Result<u64, SlotOffsetIndexError> {
+pub async fn slot_to_offset(slot: u64) -> Result<u64, SlotOffsetIndexError> {
     if let Some(offset) = SLOT_OFFSET_RESULT_CACHE.get(&slot) {
         return Ok(*offset);
     }
 
-    let offset = SLOT_OFFSET_INDEX.get_offset(slot, pool).await?;
+    let offset = SLOT_OFFSET_INDEX.get_offset(slot).await?;
     SLOT_OFFSET_RESULT_CACHE.insert(slot, offset);
     Ok(offset)
 }
-
 
 /// Client that resolves slot offsets using compact CAR index files from Old Faithful.
 pub struct SlotOffsetIndex {
@@ -176,14 +174,14 @@ impl SlotOffsetIndex {
     async fn load_epoch_indexes(
         &self,
         epoch: u64,
-        pool: &HttpPool,
     ) -> Result<(SlotCidIndex, CidOffsetIndex), SlotOffsetIndexError> {
-        // use pool-aware fetch for CAR header/root CID
-        let (root_cid, car_url) = fetch_epoch_root(pool, &self.base_url, epoch).await?;
+        let (root_cid, car_url) = fetch_epoch_root(&self.client, &self.base_url, epoch).await?;
         let root_base32 = root_cid
             .to_string_of_base(Base::Base32Lower)
-            .map_err(|err| SlotOffsetIndexError::CarHeaderError(car_url.clone(), err.to_string()))?;
-    
+            .map_err(|err| {
+                SlotOffsetIndexError::CarHeaderError(car_url.clone(), err.to_string())
+            })?;
+
         let slot_index_path = format!(
             "{0}/epoch-{0}-{1}-{2}-slot-to-cid.index",
             epoch, root_base32, self.network
@@ -192,31 +190,30 @@ impl SlotOffsetIndex {
             "{0}/epoch-{0}-{1}-{2}-cid-to-offset-and-size.index",
             epoch, root_base32, self.network
         );
-    
+
         let slot_index_url = self.base_url.join(&slot_index_path).map_err(|err| {
             SlotOffsetIndexError::InvalidIndexUrl(format!("{slot_index_path} ({err})"))
         })?;
         let cid_index_url = self.base_url.join(&cid_index_path).map_err(|err| {
             SlotOffsetIndexError::InvalidIndexUrl(format!("{cid_index_path} ({err})"))
         })?;
-    
-        // change open() to accept pool instead of Client (same function name)
+
         let slot_index = SlotCidIndex::open(
-            pool,
+            self.client.clone(),
             slot_index_url.clone(),
             SLOT_TO_CID_KIND,
             None,
         )
         .await?;
-    
+
         let cid_index = CidOffsetIndex::open(
-            pool,
+            self.client.clone(),
             cid_index_url.clone(),
             CID_TO_OFFSET_KIND,
             Some(CidOffsetIndex::OFFSET_AND_SIZE_VALUE_SIZE),
         )
         .await?;
-    
+
         if let Some(meta_epoch) = slot_index.metadata_epoch()
             && meta_epoch != epoch
         {
@@ -233,12 +230,12 @@ impl SlotOffsetIndex {
                 "CID index epoch metadata mismatch: expected {epoch}, got {meta_epoch}"
             );
         }
-    
+
         Ok((slot_index, cid_index))
     }
 
     /// Resolves the byte offset of `slot` within its Old Faithful CAR archive.
-    pub async fn get_offset(&self, slot: u64, pool: &HttpPool) -> Result<u64, SlotOffsetIndexError> {
+    pub async fn get_offset(&self, slot: u64) -> Result<u64, SlotOffsetIndexError> {
         if let Some(offset) = SLOT_OFFSET_RESULT_CACHE.get(&slot) {
             return Ok(*offset);
         }
@@ -253,7 +250,7 @@ impl SlotOffsetIndex {
         let indexes = entry_arc
             .indexes
             .get_or_try_init(|| async {
-                let (slot_index, cid_index) = self.load_epoch_indexes(epoch, pool).await?;
+                let (slot_index, cid_index) = self.load_epoch_indexes(epoch).await?;
                 let (slot_start, slot_end_inclusive) = epoch_to_slot_range(epoch);
                 Ok(Arc::new(EpochIndexes::new(
                     slot_index,
@@ -361,8 +358,8 @@ struct RemoteIndexFile {
 }
 
 impl RemoteIndexFile {
-    async fn download(pool: &HttpPool, url: Url) -> Result<Self, SlotOffsetIndexError> {
-        let bytes = fetch_full(pool, &url).await?;
+    async fn download(client: &Client, url: Url) -> Result<Self, SlotOffsetIndexError> {
+        let bytes = fetch_full(client, &url).await?;
         Ok(Self {
             url,
             data: Arc::from(bytes),
@@ -412,7 +409,7 @@ struct SlotCidIndex {
 
 impl SlotCidIndex {
     async fn open(
-        pool: &HttpPool,
+        client: Client,
         url: Url,
         expected_kind: &[u8],
         expected_value_size: Option<u64>,
@@ -423,17 +420,19 @@ impl SlotCidIndex {
             .and_then(|mut segments| segments.next_back())
             .and_then(|name| name.split('-').nth(1))
             .and_then(|value| value.parse::<u64>().ok());
-    
         if let Some(epoch) = epoch_hint {
             info!(
                 target: LOG_MODULE,
                 "Fetching {kind_label} compact index for epoch {epoch}"
             );
         } else {
-            info!(target: LOG_MODULE, "Fetching {kind_label} compact index");
+            info!(
+                target: LOG_MODULE,
+                "Fetching {kind_label} compact index"
+            );
         }
-    
-        let file = Arc::new(RemoteIndexFile::download(pool, url.clone()).await?);
+
+        let file = Arc::new(RemoteIndexFile::download(&client, url.clone()).await?);
         let header =
             parse_compact_index_header(file.bytes(), &url, expected_kind, expected_value_size)?;
         Ok(Self {
@@ -521,7 +520,7 @@ impl SlotCidIndex {
 }
 
 struct CidOffsetIndex {
-    pool: Arc<HttpPool>,
+    client: Client,
     url: Url,
     header: CompactIndexHeader,
     bucket_entries: DashMap<u32, Arc<RemoteBucketEntry>>,
@@ -530,9 +529,8 @@ struct CidOffsetIndex {
 impl CidOffsetIndex {
     const OFFSET_AND_SIZE_VALUE_SIZE: u64 = 9;
 
-    
     async fn open(
-        pool: &HttpPool,
+        client: Client,
         url: Url,
         expected_kind: &[u8],
         expected_value_size: Option<u64>,
@@ -543,19 +541,22 @@ impl CidOffsetIndex {
             .and_then(|mut segments| segments.next_back())
             .and_then(|name| name.split('-').nth(1))
             .and_then(|value| value.parse::<u64>().ok());
-
         if let Some(epoch) = epoch_hint {
             info!(
                 target: LOG_MODULE,
                 "Fetching {kind_label} compact index for epoch {epoch}"
             );
         } else {
-            info!(target: LOG_MODULE, "Fetching {kind_label} compact index");
+            info!(
+                target: LOG_MODULE,
+                "Fetching {kind_label} compact index"
+            );
         }
 
-        let header = fetch_and_parse_header(pool, &url, expected_kind, expected_value_size).await?;
+        let header =
+            fetch_and_parse_header(&client, &url, expected_kind, expected_value_size).await?;
         Ok(Self {
-            pool: Arc::new(pool.clone()),
+            client,
             url,
             header,
             bucket_entries: DashMap::new(),
@@ -601,17 +602,16 @@ impl CidOffsetIndex {
     }
 
     async fn load_bucket(&self, index: u32) -> Result<Arc<RemoteBucketData>, SlotOffsetIndexError> {
-        let bucket_header_offset = self.header.header_size + (index as u64) * BUCKET_HEADER_SIZE as u64;
-    
+        let bucket_header_offset =
+            self.header.header_size + (index as u64) * BUCKET_HEADER_SIZE as u64;
         let header_bytes = fetch_range(
-            &self.pool,
+            &self.client,
             &self.url,
             bucket_header_offset,
             bucket_header_offset + BUCKET_HEADER_SIZE as u64 - 1,
             true,
         )
         .await?;
-    
         if header_bytes.len() != BUCKET_HEADER_SIZE {
             return Err(SlotOffsetIndexError::IndexFormatError(
                 self.url.clone(),
@@ -621,22 +621,23 @@ impl CidOffsetIndex {
                 ),
             ));
         }
-    
         let bucket_header = BucketHeader::from_bytes(header_bytes.try_into().unwrap());
         let stride = bucket_header.hash_len as usize + self.header.value_size as usize;
         let data_len = stride * bucket_header.num_entries as usize;
         let data_start = bucket_header.file_offset;
         let data_end = data_start + data_len as u64 - 1;
-    
-        let data = fetch_range(&self.pool, &self.url, data_start, data_end, true).await?;
-    
+        let data = fetch_range(&self.client, &self.url, data_start, data_end, true).await?;
         if data.len() != data_len {
             return Err(SlotOffsetIndexError::IndexFormatError(
                 self.url.clone(),
-                format!("expected {} bytes of bucket data, got {}", data_len, data.len()),
+                format!(
+                    "expected {} bytes of bucket data, got {}",
+                    data_len,
+                    data.len()
+                ),
             ));
         }
-    
+
         Ok(Arc::new(RemoteBucketData::new(
             bucket_header,
             data,
@@ -894,12 +895,12 @@ pub(crate) async fn wait_for_remote_hit_slot() {
 }
 
 async fn fetch_and_parse_header(
-    pool: &HttpPool,
+    client: &Client,
     url: &Url,
     expected_kind: &[u8],
     expected_value_size: Option<u64>,
 ) -> Result<CompactIndexHeader, SlotOffsetIndexError> {
-    let mut bytes = fetch_range(pool, url, 0, HTTP_PREFETCH_BYTES - 1, false).await?;
+    let mut bytes = fetch_range(client, url, 0, HTTP_PREFETCH_BYTES - 1, false).await?;
     if bytes.len() < 12 {
         return Err(SlotOffsetIndexError::IndexFormatError(
             url.clone(),
@@ -915,7 +916,7 @@ async fn fetch_and_parse_header(
     let header_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
     let total_header_size = 8 + 4 + header_len;
     if bytes.len() < total_header_size {
-        bytes = fetch_range(pool, url, 0, total_header_size as u64 - 1, false).await?;
+        bytes = fetch_range(client, url, 0, total_header_size as u64 - 1, false).await?;
         if bytes.len() < total_header_size {
             return Err(SlotOffsetIndexError::IndexFormatError(
                 url.clone(),
@@ -1003,7 +1004,7 @@ fn parse_compact_index_header(
 }
 
 async fn fetch_epoch_root(
-    pool: &HttpPool,
+    client: &Client,
     base_url: &Url,
     epoch: u64,
 ) -> Result<(Cid, Url), SlotOffsetIndexError> {
@@ -1012,13 +1013,12 @@ async fn fetch_epoch_root(
         .join(&car_path)
         .map_err(|err| SlotOffsetIndexError::InvalidIndexUrl(format!("{car_path} ({err})")))?;
 
-    let mut bytes = fetch_range(pool, &car_url, 0, HTTP_PREFETCH_BYTES - 1, false).await?;
+    let mut bytes = fetch_range(client, &car_url, 0, HTTP_PREFETCH_BYTES - 1, false).await?;
     let (header_len, prefix) = decode_varint(&bytes)
         .map_err(|msg| SlotOffsetIndexError::CarHeaderError(car_url.clone(), msg))?;
     let total_needed = prefix + header_len as usize;
-
     if bytes.len() < total_needed {
-        bytes = fetch_range(pool, &car_url, 0, total_needed as u64 - 1, false).await?;
+        bytes = fetch_range(client, &car_url, 0, total_needed as u64 - 1, false).await?;
         if bytes.len() < total_needed {
             return Err(SlotOffsetIndexError::CarHeaderError(
                 car_url.clone(),
@@ -1029,7 +1029,6 @@ async fn fetch_epoch_root(
             ));
         }
     }
-
     let header_bytes = &bytes[prefix..total_needed];
     let value: Value = serde_cbor::from_slice(header_bytes).map_err(|err| {
         SlotOffsetIndexError::CarHeaderError(
@@ -1037,10 +1036,8 @@ async fn fetch_epoch_root(
             format!("failed to decode CBOR: {err}"),
         )
     })?;
-
     let root_cid = extract_root_cid(&value)
         .map_err(|msg| SlotOffsetIndexError::CarHeaderError(car_url.clone(), msg.to_string()))?;
-
     Ok((root_cid, car_url))
 }
 
@@ -1111,23 +1108,16 @@ fn decode_cid_bytes(bytes: &[u8]) -> Result<Cid, String> {
         .unwrap_or_else(|| "invalid CID bytes".into()))
 }
 
-async fn fetch_full(pool: &HttpPool, url: &Url) -> Result<Vec<u8>, SlotOffsetIndexError> {
+async fn fetch_full(client: &Client, url: &Url) -> Result<Vec<u8>, SlotOffsetIndexError> {
     let mut attempt = 0usize;
     loop {
         wait_for_remote_hit_slot().await;
-
-        let (idx, proxy, client) = pool.pick_with_meta();
-        if let Some(p) = proxy {
-            eprintln!("[index] fetch_full attempt={} idx={} proxy={} url={}", attempt + 1, idx, p, url);
-        } else {
-            eprintln!("[index] fetch_full attempt={} idx={} direct url={}", attempt + 1, idx, url);
-        }
-
         let response = match client.get(url.clone()).send().await {
             Ok(resp) => resp,
             Err(err) => {
                 if attempt < FETCH_RANGE_MAX_RETRIES {
-                    let delay_ms = FETCH_RANGE_BASE_DELAY_MS;
+                    let delay_ms =
+                        FETCH_RANGE_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(10));
                     warn!(
                         target: LOG_MODULE,
                         "Network error fetching {}: {}; retrying in {} ms (attempt {}/{})",
@@ -1184,7 +1174,8 @@ async fn fetch_full(pool: &HttpPool, url: &Url) -> Result<Vec<u8>, SlotOffsetInd
             Ok(bytes) => return Ok(bytes),
             Err(err @ SlotOffsetIndexError::NetworkError(_, _)) => {
                 if attempt < FETCH_RANGE_MAX_RETRIES {
-                    let delay_ms = FETCH_RANGE_BASE_DELAY_MS;
+                    let delay_ms =
+                        FETCH_RANGE_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(10));
                     warn!(
                         target: LOG_MODULE,
                         "Error reading {} body: {}; retrying in {} ms (attempt {}/{})",
@@ -1224,9 +1215,8 @@ async fn read_response_with_progress(
     Ok(bytes)
 }
 
-
 async fn fetch_range(
-    pool: &HttpPool,
+    client: &Client,
     url: &Url,
     start: u64,
     end: u64,
@@ -1237,32 +1227,8 @@ async fn fetch_range(
     }
     let range_header = format!("bytes={start}-{end}");
     let mut attempt = 0usize;
-
     loop {
         wait_for_remote_hit_slot().await;
-
-        let (idx, proxy, client) = pool.pick_with_meta();
-        if let Some(p) = proxy {
-            eprintln!(
-                "[index] fetch_range attempt={} idx={} proxy={} url={} range={}-{}",
-                attempt + 1,
-                idx,
-                p,
-                url,
-                start,
-                end
-            );
-        } else {
-            eprintln!(
-                "[index] fetch_range attempt={} idx={} direct url={} range={}-{}",
-                attempt + 1,
-                idx,
-                url,
-                start,
-                end
-            );
-        }
-
         let response = match client
             .get(url.clone())
             .header(RANGE, range_header.clone())
@@ -1272,7 +1238,8 @@ async fn fetch_range(
             Ok(resp) => resp,
             Err(err) => {
                 if attempt < FETCH_RANGE_MAX_RETRIES {
-                    let delay_ms = FETCH_RANGE_BASE_DELAY_MS;
+                    let delay_ms =
+                        FETCH_RANGE_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(10));
                     warn!(
                         target: LOG_MODULE,
                         "Network error fetching {} (range {}-{}): {}; retrying in {} ms (attempt {}/{})",
@@ -1333,7 +1300,8 @@ async fn fetch_range(
             Ok(bytes) => bytes,
             Err(err) => {
                 if attempt < FETCH_RANGE_MAX_RETRIES {
-                    let delay_ms = FETCH_RANGE_BASE_DELAY_MS;
+                    let delay_ms =
+                        FETCH_RANGE_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(10));
                     warn!(
                         target: LOG_MODULE,
                         "Error reading {} (range {}-{}) body: {}; retrying in {} ms (attempt {}/{})",
@@ -1352,7 +1320,6 @@ async fn fetch_range(
                 return Err(SlotOffsetIndexError::NetworkError(url.clone(), err));
             }
         };
-
         let expected = (end - start + 1) as usize;
         if exact && bytes.len() != expected {
             return Err(SlotOffsetIndexError::IndexFormatError(
@@ -1360,7 +1327,6 @@ async fn fetch_range(
                 format!("expected {expected} bytes, got {}", bytes.len()),
             ));
         }
-
         return Ok(bytes.to_vec());
     }
 }
@@ -1399,11 +1365,122 @@ fn parse_metadata(data: &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>, String> {
     Ok(map)
 }
 
-/// Resolves the base URL used to fetch compact index artifacts.
+/// Resolves the base URL used when constructing the global [`SLOT_OFFSET_INDEX`].
 ///
-/// Uses `JETSTREAMER_COMPACT_INDEX_BASE_URL` when set, otherwise falls back to [`BASE_URL`].
+/// The resolution order is:
+/// 1. `JETSTREAMER_COMPACT_INDEX_BASE_URL`
+/// 2. The built-in [`BASE_URL`], pointing at Old Faithful's public mirror.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use jetstreamer_firehose::index::get_index_base_url;
+/// unsafe {
+///     std::env::set_var("JETSTREAMER_COMPACT_INDEX_BASE_URL", "https://mirror.example.com/indexes");
+/// }
+///
+/// let base = get_index_base_url().expect("valid URL");
+/// assert_eq!(base.as_str(), "https://mirror.example.com/indexes");
+/// ```
 pub fn get_index_base_url() -> Result<Url, SlotOffsetIndexError> {
     let base = std::env::var("JETSTREAMER_COMPACT_INDEX_BASE_URL")
         .unwrap_or_else(|_| BASE_URL.to_string());
     Url::parse(&base).map_err(|err| SlotOffsetIndexError::InvalidBaseUrl(format!("{base} ({err})")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_logger() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            solana_logger::setup_with_default("info");
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn test_epoch_800_hydration_time() {
+        init_logger();
+        SLOT_OFFSET_RESULT_CACHE.clear();
+        EPOCH_CACHE.clear();
+
+        let base = get_index_base_url().expect("base url");
+        let index = SlotOffsetIndex::new(base).expect("slot offset index");
+        let epoch = 800;
+        let download_started = Instant::now();
+        let (_slot_index, _cid_index) = index
+            .load_epoch_indexes(epoch)
+            .await
+            .expect("download epoch indexes");
+        let download_elapsed = download_started.elapsed();
+
+        let (slot_start, slot_end) = epoch_to_slot_range(epoch);
+        info!(
+            target: LOG_MODULE,
+            "epoch {epoch} index download took {:?}",
+            download_elapsed
+        );
+        let mut previous_offset = None;
+        let mut successful_slots: Vec<(u64, u64)> = Vec::new();
+        let mut slot = slot_start;
+        while successful_slots.len() < 10 && slot <= slot_end {
+            let lookup_started = Instant::now();
+            match index.get_offset(slot).await {
+                Ok(offset) => {
+                    let elapsed = lookup_started.elapsed();
+                    info!(
+                        target: LOG_MODULE,
+                        "epoch {epoch} lookup {} for slot {slot} returned offset {offset} in {:?}",
+                        successful_slots.len(),
+                        elapsed
+                    );
+                    if let Some(prev) = previous_offset {
+                        assert!(
+                            offset >= prev,
+                            "slot offsets must be non-decreasing (prev {prev}, now {offset})"
+                        );
+                    }
+                    successful_slots.push((slot, offset));
+                    previous_offset = Some(offset);
+                }
+                Err(SlotOffsetIndexError::SlotNotFound(_, _)) => {
+                    info!(
+                        target: LOG_MODULE,
+                        "epoch {epoch} skipping leader-missing slot {slot}"
+                    );
+                }
+                Err(err) => panic!("lookup for slot {slot} failed: {err}"),
+            }
+            slot += 1;
+        }
+        assert!(
+            successful_slots.len() == 10,
+            "epoch {epoch} expected 10 successful slots starting at {slot_start}, only found {}",
+            successful_slots.len()
+        );
+
+        info!(
+            target: LOG_MODULE,
+            "Repeating first three successful slot lookups to verify caching"
+        );
+        for (idx, (slot, offset)) in successful_slots.iter().take(3).enumerate() {
+            let lookup_started = Instant::now();
+            let repeat = index
+                .get_offset(*slot)
+                .await
+                .unwrap_or_else(|err| panic!("repeat lookup for slot {slot} failed: {err}"));
+            assert_eq!(
+                *offset, repeat,
+                "repeat lookup for slot {slot} returned different offset (expected {offset}, got {repeat})"
+            );
+            let elapsed = lookup_started.elapsed();
+            info!(
+                target: LOG_MODULE,
+                "epoch {epoch} repeat lookup {idx} for slot {slot} returned offset {repeat} in {:?}",
+                elapsed
+            );
+        }
+    }
 }

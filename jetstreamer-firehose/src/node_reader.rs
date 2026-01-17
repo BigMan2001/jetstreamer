@@ -16,7 +16,6 @@ use std::time::Instant;
 use std::vec::Vec;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 use tokio::task::yield_now;
-use std::sync::Arc;
 
 const MAX_VARINT_LEN_64: usize = 10;
 const MIN_SEEK_SPACING_MS: u64 = 51;
@@ -173,20 +172,18 @@ pub struct NodeReader<R: AsyncRead + AsyncSeek + Len> {
     pub header: Vec<u8>,
     /// Number of Old Faithful items that have been read so far.
     pub item_index: u64,
-    /// HTTP pool used for compact index fetches (slot->offset), to avoid direct client usage.
-    pub pool: Arc<crate::epoch::HttpPool>,
 }
 
 impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
     /// Wraps an async reader and primes it for Old Faithful CAR decoding.
-    pub fn new(reader: R, pool: Arc<crate::epoch::HttpPool>) -> NodeReader<R> {
+    pub const fn new(reader: R) -> NodeReader<R> {
         NodeReader {
             reader,
             header: vec![],
             item_index: 0,
-            pool,
         }
     }
+
     /// Returns the raw Old Faithful CAR header, fetching and caching it on first use.
     pub async fn read_raw_header(&mut self) -> Result<Vec<u8>, SharedError> {
         if !self.header.is_empty() {
@@ -221,7 +218,7 @@ impl<R: AsyncRead + Unpin + AsyncSeek + Len> NodeReader<R> {
 
         let epoch = slot_to_epoch(slot);
 
-        let res = slot_to_offset(slot, &self.pool).await;
+        let res = slot_to_offset(slot).await;
         if let Err(SlotOffsetIndexError::SlotNotFound(..)) = res {
             log::warn!(
                 target: LOG_MODULE,
@@ -356,7 +353,7 @@ pub fn cid_from_cbor_link(val: &serde_cbor::Value) -> Result<cid::Cid, SharedErr
 
 #[tokio::test]
 async fn test_async_node_reader() {
-    use crate::epoch::fetch_epoch_stream;
+    use crate::epochs::fetch_epoch_stream;
     let client = reqwest::Client::new();
     let stream = fetch_epoch_stream(670, &client).await;
     let mut reader = NodeReader::new(stream);
