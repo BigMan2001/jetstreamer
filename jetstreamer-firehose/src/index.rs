@@ -59,7 +59,7 @@ const METADATA_KEY_KIND: &[u8] = b"index_kind";
 const METADATA_KEY_EPOCH: &[u8] = b"epoch";
 const HTTP_PREFETCH_BYTES: u64 = 4 * 1024; // initial bytes to fetch for headers
 const FETCH_RANGE_MAX_RETRIES: usize = 10;
-const FETCH_RANGE_BASE_DELAY_MS: u64 = 10_000;
+const FETCH_RANGE_BASE_DELAY_MS: u64 = 5_000;
 const MIN_HIT_SPACING_MS: u64 = 20;
 
 /// Errors returned while accessing the compact slot offset index.
@@ -1127,8 +1127,7 @@ async fn fetch_full(pool: &HttpPool, url: &Url) -> Result<Vec<u8>, SlotOffsetInd
             Ok(resp) => resp,
             Err(err) => {
                 if attempt < FETCH_RANGE_MAX_RETRIES {
-                    let delay_ms =
-                        FETCH_RANGE_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(10));
+                    let delay_ms = FETCH_RANGE_BASE_DELAY_MS;
                     warn!(
                         target: LOG_MODULE,
                         "Network error fetching {}: {}; retrying in {} ms (attempt {}/{})",
@@ -1185,8 +1184,7 @@ async fn fetch_full(pool: &HttpPool, url: &Url) -> Result<Vec<u8>, SlotOffsetInd
             Ok(bytes) => return Ok(bytes),
             Err(err @ SlotOffsetIndexError::NetworkError(_, _)) => {
                 if attempt < FETCH_RANGE_MAX_RETRIES {
-                    let delay_ms =
-                        FETCH_RANGE_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(10));
+                    let delay_ms = FETCH_RANGE_BASE_DELAY_MS;
                     warn!(
                         target: LOG_MODULE,
                         "Error reading {} body: {}; retrying in {} ms (attempt {}/{})",
@@ -1274,8 +1272,7 @@ async fn fetch_range(
             Ok(resp) => resp,
             Err(err) => {
                 if attempt < FETCH_RANGE_MAX_RETRIES {
-                    let delay_ms =
-                        FETCH_RANGE_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(10));
+                    let delay_ms = FETCH_RANGE_BASE_DELAY_MS;
                     warn!(
                         target: LOG_MODULE,
                         "Network error fetching {} (range {}-{}): {}; retrying in {} ms (attempt {}/{})",
@@ -1336,8 +1333,7 @@ async fn fetch_range(
             Ok(bytes) => bytes,
             Err(err) => {
                 if attempt < FETCH_RANGE_MAX_RETRIES {
-                    let delay_ms =
-                        FETCH_RANGE_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(10));
+                    let delay_ms = FETCH_RANGE_BASE_DELAY_MS;
                     warn!(
                         target: LOG_MODULE,
                         "Error reading {} (range {}-{}) body: {}; retrying in {} ms (attempt {}/{})",
