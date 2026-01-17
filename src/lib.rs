@@ -130,6 +130,9 @@ use jetstreamer_plugin::{
 use std::sync::Arc;
 use std::collections::HashSet;
 const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker threads
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 #[derive(Clone, Copy)]
 struct ClickhouseSettings {
@@ -382,7 +385,7 @@ impl JetstreamerRunner {
     }
 
     /// Builds the plugin runtime and streams blocks through every registered [`Plugin`].
-    pub fn run(self, slots_filter: HashSet<u64>) -> Result<(), PluginRunnerError> {
+    pub fn run(self, slots_filter: HashSet<u64>, proxies_file: Option<impl AsRef<Path>>) -> Result<(), PluginRunnerError> {
         solana_logger::setup_with_default(&self.log_level);
 
         if let Ok(index_url) = get_index_base_url() {
@@ -405,7 +408,7 @@ impl JetstreamerRunner {
             clickhouse_enabled
         );
 
-        let mut runner = PluginRunner::new(&self.clickhouse_dsn, threads, slots_filter);
+        let mut runner = PluginRunner::new(&self.clickhouse_dsn, threads, slots_filter, proxies_file);
         for plugin in &self.config.builtin_plugins {
             runner.register(plugin.instantiate());
         }

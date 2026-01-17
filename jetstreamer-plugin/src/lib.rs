@@ -122,7 +122,7 @@ use std::{
     },
     time::Duration,
 };
-
+use std::path::Path;
 use clickhouse::{Client, Row};
 use dashmap::DashMap;
 use futures_util::FutureExt;
@@ -278,6 +278,7 @@ impl PluginRunner {
     pub async fn run(
         self: Arc<Self>,
         slot_range: Range<u64>,
+        proxies_file: Option<impl AsRef<Path>>,
         clickhouse_enabled: bool,
     ) -> Result<(), PluginRunnerError> {
         let db_update_interval = self.db_update_interval_slots.max(1);
@@ -410,6 +411,7 @@ impl PluginRunner {
             self.num_threads as u64,
             slot_range,
             self.slots_filter.clone(),
+            proxies_file,
             None::<fn(usize, BlockData) -> _>,
             Some(on_transaction),
             None::<fn(usize, EntryData) -> _>,
