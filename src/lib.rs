@@ -133,6 +133,7 @@ const WORKER_THREAD_MULTIPLIER: usize = 4; // each plugin thread gets 4 worker t
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+use std::path::Path;
 
 #[derive(Clone, Copy)]
 struct ClickhouseSettings {
@@ -408,7 +409,7 @@ impl JetstreamerRunner {
             clickhouse_enabled
         );
 
-        let mut runner = PluginRunner::new(&self.clickhouse_dsn, threads, slots_filter, proxies_file);
+        let mut runner = PluginRunner::new(&self.clickhouse_dsn, threads, slots_filter);
         for plugin in &self.config.builtin_plugins {
             runner.register(plugin.instantiate());
         }
@@ -477,7 +478,7 @@ impl JetstreamerRunner {
             }
         }
 
-        let result = runtime.block_on(runner.run(slot_range.clone(), clickhouse_enabled));
+        let result = runtime.block_on(runner.run(slot_range.clone(), proxies_file, clickhouse_enabled));
 
         if spawn_clickhouse {
             let handle = clickhouse_task.take();
