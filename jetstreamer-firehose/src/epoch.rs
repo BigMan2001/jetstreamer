@@ -12,6 +12,7 @@ use {
     },
     tokio::io::{AsyncRead, AsyncSeek, BufReader},
 };
+
 use std::path::Path;
 
 use rseek::Seekable;
@@ -32,6 +33,7 @@ pub const BASE_URL: &str = "https://files.old-faithful.net";
 #[derive(Clone)]
 pub struct HttpPool {
     clients: Arc<Vec<Client>>,
+    proxies: Arc<Vec<Option<String>>>, // None => direct
     rr: Arc<AtomicUsize>,
 }
 
@@ -44,31 +46,43 @@ impl HttpPool {
     ///
     /// If `proxies` is empty, the pool contains a single direct client (no proxy).
     pub fn new(proxies: Vec<String>) -> Self {
-        let clients = if proxies.is_empty() {
-            vec![Self::build_client(None)]
-        } else {
-            proxies
-                .iter()
-                .map(|p| Self::build_client(Some(p.as_str())))
-                .collect()
-        };
+        if proxies.is_empty() {
+            return Self {
+                clients: Arc::new(vec![Self::build_client(None)]),
+                proxies: Arc::new(vec![None]),
+                rr: Arc::new(AtomicUsize::new(0)),
+            };
+        }
+
+        let mut clients: Vec<Client> = Vec::with_capacity(proxies.len());
+        let mut meta: Vec<Option<String>> = Vec::with_capacity(proxies.len());
+
+        for p in proxies {
+            clients.push(Self::build_client(Some(p.as_str())));
+            meta.push(Some(p));
+        }
 
         Self {
             clients: Arc::new(clients),
+            proxies: Arc::new(meta),
             rr: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// Picks a client from the pool using round-robin selection.
+    ///
+    /// Returns `(idx, proxy_url, client)` where `proxy_url` is `None` for direct clients.
     #[inline]
-    pub fn pick(&self) -> Client {
+    pub fn pick_with_meta(&self) -> (usize, Option<&str>, Client) {
         let idx = self.rr.fetch_add(1, Ordering::Relaxed) % self.clients.len();
-        self.clients[idx].clone()
+        let proxy = self.proxies[idx].as_deref();
+        (idx, proxy, self.clients[idx].clone())
     }
 
     fn build_client(proxy: Option<&str>) -> Client {
         let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            // 10s can be aggressive for large/ranged reads; adjust if needed.
             .timeout(Duration::from_secs(10))
             .pool_idle_timeout(Duration::from_secs(30))
             .tcp_keepalive(Duration::from_secs(30));
@@ -80,7 +94,6 @@ impl HttpPool {
         builder.build().expect("failed to build reqwest client")
     }
 }
-
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /*  Epoch node                                                                 */
@@ -159,23 +172,35 @@ impl Epoch {
     }
 }
 
-
 /// Fetches an epoch’s CAR file from Old Faithful as a buffered, seekable async stream.
 ///
 /// The returned reader implements [`Len`] and can be consumed sequentially or
 /// randomly via [`AsyncSeek`].
-pub async fn fetch_epoch_stream(epoch: u64, pool: Arc<HttpPool>) -> impl AsyncRead + AsyncSeek + Len {
+///
+/// Logging:
+/// - Logs which pool index is used and the proxy URL (if any).
+/// - Note: we cannot log HTTP status here because `rseek` performs the `.send().await` internally.
+pub async fn fetch_epoch_stream(
+    epoch: u64,
+    pool: Arc<HttpPool>,
+) -> impl AsyncRead + AsyncSeek + Len {
+    let url = format!("{}/{}/epoch-{}.car", BASE_URL, epoch, epoch);
+
     let seekable = Seekable::new(move || {
-        // rseek will call this closure whenever it needs to (re)open/range-read;
-        // each call can pick a different proxy/client.
-        let client = pool.pick();
-        client.get(format!("{}/{}/epoch-{}.car", BASE_URL, epoch, epoch))
+        let (idx, proxy, client) = pool.pick_with_meta();
+
+        if let Some(p) = proxy {
+            eprintln!("[old-faithful] epoch={epoch} open idx={idx} proxy={p} url={url}");
+        } else {
+            eprintln!("[old-faithful] epoch={epoch} open idx={idx} direct url={url}");
+        }
+
+        client.get(url.clone())
     })
     .await;
 
     BufReader::with_capacity(8 * 1024 * 1024, seekable)
 }
-
 
 /// Reads a proxy list file and converts it into a list of proxy URLs.
 ///
@@ -186,7 +211,8 @@ pub async fn fetch_epoch_stream(epoch: u64, pool: Arc<HttpPool>) -> impl AsyncRe
 /// - Empty lines are ignored.
 /// - Lines starting with `#` are treated as comments and ignored.
 /// - Whitespace around each line is trimmed.
-/// ```
+///
+/// Returns proxies as `http://user:pass@ip:port` strings (ready for `reqwest::Proxy::all`).
 pub fn read_proxies_file(path: impl AsRef<Path>) -> std::io::Result<Vec<String>> {
     let content = std::fs::read_to_string(path)?;
     let mut out = Vec::new();
