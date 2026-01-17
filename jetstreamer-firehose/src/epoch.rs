@@ -83,7 +83,7 @@ impl HttpPool {
         let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             // 10s can be aggressive for large/ranged reads; adjust if needed.
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
             .pool_idle_timeout(Duration::from_secs(30))
             .tcp_keepalive(Duration::from_secs(30));
 
